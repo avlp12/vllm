@@ -13,6 +13,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers import kpool_row_split
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     expand_pools_and_append_tail,
     expand_pools_to_tokens,
@@ -504,11 +505,21 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seq_lens,
                 )
 
-            q_slice = q_quant[chunk.token_start : chunk.token_end]
+            row_split = kpool_row_split.plan(
+                chunk,
+                attn_metadata_narrowed,
+                fp8_cache=(
+                    current_platform.is_cuda() and not use_fp4_cache and index_kpool > 1
+                ),
+            )
+            row_start, row_end = row_split or (0, chunk.token_end - chunk.token_start)
+            query_start = chunk.token_start + row_start
+            query_end = chunk.token_start + row_end
+            starts = chunk.cu_seqlen_ks[row_start:row_end]
+            ends = chunk.cu_seqlen_ke[row_start:row_end]
+            q_slice = q_quant[query_start:query_end]
             q_scale_slice = (
-                q_scale[chunk.token_start : chunk.token_end]
-                if q_scale is not None
-                else None
+                q_scale[query_start:query_end] if q_scale is not None else None
             )
             # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
             # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.
@@ -523,9 +534,9 @@ def sparse_attn_indexer_kpool(
             logits = fp8_fp4_mqa_logits(
                 (q_slice_cast, q_scale_slice),
                 (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
+                weights[query_start:query_end],
+                starts,
+                ends,
                 clean_logits=False,
             )
             num_rows = logits.shape[0]
@@ -547,8 +558,8 @@ def sparse_attn_indexer_kpool(
             if current_platform.is_xpu():
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    starts,
+                    ends,
                     topk_dst,
                     num_rows,
                     logits.stride(0),
@@ -558,14 +569,17 @@ def sparse_attn_indexer_kpool(
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    starts,
+                    ends,
                     topk_dst,
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
                     select_k,
                 )
+
+            if row_split is not None:
+                pool_topk = kpool_row_split.gather(pool_topk)
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -578,7 +592,7 @@ def sparse_attn_indexer_kpool(
                         + 1
                     )
                     expanded = expand_pools_and_append_tail(
-                        pool_ids, q_seq, index_kpool
+                        pool_ids[:, : select_k - 1], q_seq, index_kpool
                     )
                 else:
                     valid = pool_ids >= 0
@@ -871,7 +885,9 @@ def sparse_attn_indexer_kpool(
                 if dec_seq.ndim == 2:
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
-            out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+            out = expand_pools_and_append_tail(
+                pool_ids[:, : select_k - 1], dec_seq, index_kpool
+            )
         else:
             out = topk_dst
 
@@ -965,6 +981,8 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        if current_platform.is_cuda():
+            kpool_row_split.initialize_row_split()
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
